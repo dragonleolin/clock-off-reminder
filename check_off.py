@@ -13,7 +13,6 @@ def get_target_folder(outlook):
         return inbox.Folders["打卡信件"]
     except Exception:
         try:
-            # 嘗試在根目錄尋找
             for folder in outlook.Folders:
                 try:
                     return folder.Folders["打卡信件"]
@@ -25,8 +24,8 @@ def get_target_folder(outlook):
 
 def parse_time_from_subject(subject, target_date):
     """
-    從主旨解析打卡時間，例如：'2026/09/14 於08:44刷卡'
-    若解析成功則回傳該 datetime 物件
+    從主旨解析打卡時間（格式如：'2026/09/14 於08:44刷卡'）
+    解析成功則回傳該 datetime 物件
     """
     match = re.search(r'於\s*(\d{1,2}):(\d{2})', subject)
     if match:
@@ -49,7 +48,6 @@ def check_clock_in_for_day(folder, today):
                 subject = str(message.Subject)
                 if "刷卡" in subject and "未下班" not in subject:
                     dt = parse_time_from_subject(subject, today)
-                    # 早上 12:00 前的刷卡視為上班卡
                     if dt and dt.hour < 12:
                         return dt
         except Exception:
@@ -57,7 +55,7 @@ def check_clock_in_for_day(folder, today):
     return None
 
 def has_clock_out_email(folder, today, clock_in_time):
-    """檢查是否已經收到當日的下班打卡信"""
+    """檢查是否已經收到當日的下班打卡信（依主旨時間解析，需晚於上班時間且在 12:00 之後）"""
     messages = folder.Items
     messages.Sort("[ReceivedTime]", True)
     
@@ -99,27 +97,26 @@ def run_daily_cycle():
     now = datetime.now()
     today = now.date()
 
-    # 週末（六日）不執行主要打卡監控
+    # 週末（六、日）不執行監控，休眠 1 小時後再次確認
     if now.weekday() >= 5:
-        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今天是週末，休眠至隔日...")
+        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今天是週末，休眠中...")
         time.sleep(3600)
         return
 
     outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
     folder = get_target_folder(outlook)
 
-    # 1. 檢查前一個工作天是否有超時通知信，並於早上 09:00 進行補登提醒
-    prev_days = 3 if now.weekday() == 0 else 1  # 若今天是週一，往前推三天（週五）
+    # 前一個工作日判定：週一檢查週五（差 3 天），其餘往前推 1 天
+    prev_days = 3 if now.weekday() == 0 else 1
     prev_work_date = today - timedelta(days=prev_days)
     overtime_notified = False
 
-    # 2. 早上 08:30 前不執行上班信偵測
+    # 1. 早上 08:30 前進入待機狀態
     earliest_check_time = datetime(today.year, today.month, today.day, 8, 30, 0)
     while datetime.now() < earliest_check_time:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 尚未到達 08:30，稍候中...")
         time.sleep(60)
 
-    # 3. 等待當日上班打卡信
+    # 2. 等待當日上班打卡信
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 開始偵測當日上班打卡信...")
     clock_in_time = None
     while not clock_in_time:
@@ -127,71 +124,71 @@ def run_daily_cycle():
         if not clock_in_time:
             time.sleep(60)
         
-        # 途中若到達早上 09:00，檢查是否需要提醒補登超時
+        # 早上 09:00 檢查前一工作天是否有超時通知
         curr = datetime.now()
         remind_time = datetime(today.year, today.month, today.day, 9, 0, 0)
         if not overtime_notified and curr >= remind_time and curr < remind_time + timedelta(minutes=10):
             if has_overtime_email(folder, prev_work_date):
-                print("【提醒】前一工作天有收到超時通知，發送補登提醒！")
+                print("【提醒】前一工作天收到超時通知，發送補登提醒！")
                 try:
                     notification.notify(
                         title='⚠️ 忘刷/超時補登提醒',
-                        message=f'您在 {prev_work_date.strftime("%m/%d")} 有收到滿工時尚未下班通知，請記得於系統補登超時！',
+                        message=f'您在 {prev_work_date.strftime("%m/%d")} 有收到滿工時尚未下班通知，請記得補登超時！',
                         timeout=20
                     )
                 except Exception as e:
                     print(f"發送補登通知失敗: {e}")
             overtime_notified = True
 
-    # 4. 上班時間 + 9 小時（8小時工時 + 1小時午休）
+    # 3. 推算下班時間（上班打卡時間 + 9 小時）
     target_time = clock_in_time + timedelta(hours=9)
     print(f"【成功抓取】上班時間: {clock_in_time.strftime('%H:%M:%S')} (主旨時間)")
     print(f"【預計提醒】下班提醒開始時間: {target_time.strftime('%H:%M:%S')}")
 
-    # 5. 等待到達下班時間
+    # 4. 等候滿 9 小時（若提前收到下班卡信件則直接標記完成）
+    clock_out_done = False
     while datetime.now() < target_time:
-        # 若在下班時間前已提早刷卡打卡，則直接結束今日下班監控
         if has_clock_out_email(folder, today, clock_in_time):
-            print("【提早打卡】已偵測到下班打卡信，今日提醒結束。")
+            print("【提早打卡】已偵測到下班打卡信，今日提醒流程結束。")
+            clock_out_done = True
             break
         time.sleep(30)
 
-    # 6. 下班提醒階段：每分鐘提醒一次，最多持續 10 分鐘（共 10 次）
-    alert_start = target_time
-    alert_end = alert_start + timedelta(minutes=10)
-    last_notify_ts = 0
+    # 5. 下班提醒階段：未打卡則每 60 秒提醒一次，上限 10 分鐘（共 10 次）
+    if not clock_out_done:
+        alert_end = target_time + timedelta(minutes=10)
+        last_notify_ts = 0
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 進入下班提醒階段（限時 10 分鐘）...")
-    while datetime.now() <= alert_end:
-        # 檢查是否已收到下班打卡信
-        if has_clock_out_email(folder, today, clock_in_time):
-            print("【已收到下班打卡信】下班打卡完成，停止提醒！")
-            break
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 進入下班提醒階段（最多持續 10 分鐘）...")
+        while datetime.now() <= alert_end:
+            if has_clock_out_email(folder, today, clock_in_time):
+                print("【已收到下班打卡信】下班打卡完成，停止提醒！")
+                clock_out_done = True
+                break
 
-        # 每 60 秒（1分鐘）跳出一次通知
-        now_ts = time.time()
-        if now_ts - last_notify_ts >= 60:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 發送下班打卡提醒...")
-            try:
-                notification.notify(
-                    title='⏰ 下班打卡提醒',
-                    message='已經滿 9 小時囉！尚未偵測到下班打卡信，請記得去刷卡！',
-                    timeout=10
-                )
-            except Exception as e:
-                print(f"通知發送失敗: {e}")
-            last_notify_ts = now_ts
+            now_ts = time.time()
+            if now_ts - last_notify_ts >= 60:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 發送下班打卡提醒...")
+                try:
+                    notification.notify(
+                        title='⏰ 下班打卡提醒',
+                        message='工作已滿 9 小時！尚未偵測到下班打卡信，請記得刷卡！',
+                        timeout=10
+                    )
+                except Exception as e:
+                    print(f"通知發送失敗: {e}")
+                last_notify_ts = now_ts
 
-        time.sleep(10)
+            time.sleep(10)
 
-    print("今日下班提醒流程已結束，程式將休眠至隔日早上 08:30 後再行偵測（保持背景開啟）...")
+    print("今日打卡與提醒流程結束，常駐等待至隔日 08:30（請勿關閉視窗）...")
 
-    # 7. 休眠至隔日 08:30
+    # 6. 安全休眠至隔日早上 08:30（支援電腦休眠喚醒）
     tomorrow = today + timedelta(days=1)
     next_wake_time = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 8, 30, 0)
-    sleep_seconds = (next_wake_time - datetime.now()).total_seconds()
-    if sleep_seconds > 0:
-        time.sleep(sleep_seconds)
+    
+    while datetime.now() < next_wake_time:
+        time.sleep(30)  # 每 30 秒檢查一次當前時間，休眠喚醒後能立刻接軌
 
 def main():
     print("=== Outlook 打卡監控服務已啟動 ===")
@@ -199,7 +196,7 @@ def main():
         try:
             run_daily_cycle()
         except Exception as e:
-            print(f"發生非預期錯誤: {e}，1 分鐘後重試...")
+            print(f"執行時發生非預期錯誤: {e}，60 秒後重試...")
             time.sleep(60)
 
 if __name__ == "__main__":
